@@ -369,6 +369,11 @@ void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
 static TextureCache::ImageDesc NullTextureDesc(const ShaderRecompiler::IR::ImageResource& resource,
                                                TextureCache::BindingType                  binding) {
 	TextureCache::ImageDesc desc {};
+	// A depth-comparison (shadow) fetch must be given a depth image. A colour image such as
+	// R32_SFLOAT cannot be sampled with depth comparison: that is undefined behaviour and loses
+	// the device on NVIDIA. Guest k32Float maps to D32_SFLOAT in the depth format policy.
+	const bool depth_null =
+	    resource.depth_compare && binding == TextureCache::BindingType::Texture;
 	switch (resource.numeric_class) {
 		case Prospero::TextureNumericClass::Float:
 			desc.info.guest_format = Prospero::BufferFormat::k32Float;
@@ -381,7 +386,8 @@ static TextureCache::ImageDesc NullTextureDesc(const ShaderRecompiler::IR::Image
 			break;
 		default: EXIT("null image has unsupported numeric class\n");
 	}
-	desc.info.pixel_format    = VulkanFormat(desc.info.guest_format);
+	desc.info.pixel_format    = depth_null ? vk::Format::eD32Sfloat
+	                                       : VulkanFormat(desc.info.guest_format);
 	desc.info.type            = Prospero::ImageType::kColor2D;
 	desc.info.extent          = {1, 1, 1};
 	desc.info.resources       = {1, 1};
@@ -389,8 +395,13 @@ static TextureCache::ImageDesc NullTextureDesc(const ShaderRecompiler::IR::Image
 	desc.info.samples         = 1;
 	desc.info.mip_layout[0]   = {0, 0, 1, 1};
 	desc.view_info.format     = desc.info.pixel_format;
-	desc.view_info.type       = vk::ImageViewType::e2D;
-	desc.view_info.aspect     = vk::ImageAspectFlagBits::eColor;
+	// The shader declares its shadow maps as arrayed images; the view must match.
+	desc.view_info.type =
+	    depth_null && resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DArray
+	        ? vk::ImageViewType::e2DArray
+	        : vk::ImageViewType::e2D;
+	desc.view_info.aspect     = depth_null ? vk::ImageAspectFlagBits::eDepth
+	                                       : vk::ImageAspectFlagBits::eColor;
 	desc.view_info.usage      = binding == TextureCache::BindingType::Storage
 	                                ? vk::ImageUsageFlagBits::eStorage
 	                                : vk::ImageUsageFlagBits::eSampled;
@@ -674,6 +685,19 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 
 	auto       id                  = texture_cache.FindImage(desc, shader_conversion);
 	auto*      image               = &texture_cache.GetImage(id);
+	// A depth-comparison (shadow) fetch on anything but a depth image is undefined on the host
+	// GPU. Bind a depth null image rather than a colour view of that memory.
+	if (resource.depth_compare && !storage && !image->depth_id && !image->info.IsDepth()) {
+		static std::atomic<uint32_t> reported {0};
+		if (reported.fetch_add(1, std::memory_order_relaxed) < 32u) {
+			LOGF("ResolveTexture: depth-compare resource resolved to a non-depth image, binding a "
+			     "depth null image: addr=0x%016" PRIx64 " guest_format=%u image_format=%d\n",
+			     address, static_cast<uint32_t>(format), static_cast<int>(image->info.pixel_format));
+		}
+		auto       null_desc = NullTextureDesc(resource, TextureCache::BindingType::Texture);
+		const auto null_id   = texture_cache.FindImage(null_desc);
+		return {null_id, nullptr, std::move(null_desc)};
+	}
 	const bool stencil_association = static_cast<bool>(image->depth_id);
 	if (stencil_association) {
 		id    = image->depth_id;
