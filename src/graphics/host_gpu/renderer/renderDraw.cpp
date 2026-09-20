@@ -36,6 +36,7 @@
 #include <bit>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -46,6 +47,38 @@
 #include <vector>
 
 namespace Libs::Graphics {
+
+namespace {
+
+// Debug aid: comma-separated hex shader hashes read from an environment variable.
+struct DebugHashList {
+	std::vector<uint64_t> values;
+
+	explicit DebugHashList(const char* name) {
+		const char* text = std::getenv(name);
+		while (text != nullptr && *text != '\0') {
+			char*      end   = nullptr;
+			const auto value = std::strtoull(text, &end, 16);
+			if (end == text) {
+				text++;
+				continue;
+			}
+			values.push_back(static_cast<uint64_t>(value));
+			text = end;
+		}
+	}
+
+	[[nodiscard]] bool Contains(uint64_t hash) const {
+		return std::find(values.begin(), values.end(), hash) != values.end();
+	}
+};
+
+const DebugHashList& SkipShaderHashes() {
+	static const DebugHashList list("KYTY_SKIP_SHADER_HASH");
+	return list;
+}
+
+} // namespace
 
 std::pair<int32_t, uint32_t> ResolveDrawOffsets(uint32_t index_offset,
 	                                           const ShaderVertexInputInfo& vs_input_info) {
@@ -1061,6 +1094,17 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
                                          vk::PrimitiveTopology topology, const DrawEmitInfo& emit,
                                          const DrawIndexBufferSource& index_source,
 	                                     bool primitive_restart_enable) {
+	// Debug bisect aid: KYTY_SKIP_SHADER_HASH=0x<hash>[,0x<hash>...] drops every draw that uses
+	// one of those pixel shaders.
+	if (state.ps_active && state.ps_input_info.stage.program != nullptr &&
+	    SkipShaderHashes().Contains(state.ps_input_info.stage.program->shader_hash)) {
+		static std::atomic<uint32_t> skipped {0};
+		if (skipped.fetch_add(1, std::memory_order_relaxed) < 16u) {
+			LOGF("SKIP draw: pixel shader hash=0x%016" PRIx64 "\n",
+			     state.ps_input_info.stage.program->shader_hash);
+		}
+		return;
+	}
 	auto& ucfg = buffer.GetUserConfig();
 	const auto vertex_stages =
 	    std::span {state.vertex_info.data(), state.programs.VertexStageCount()};

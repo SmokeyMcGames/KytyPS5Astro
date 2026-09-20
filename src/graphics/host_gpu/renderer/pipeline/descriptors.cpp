@@ -32,6 +32,7 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <cstdlib>
 #include <fmt/format.h>
 #include <limits>
 #include <span>
@@ -49,6 +50,34 @@ namespace Libs::Graphics {
 namespace {
 
 using BindingKind = ShaderRecompiler::IR::DescriptorBindingKind;
+
+// Debug aid: comma-separated hex shader hashes read from an environment variable.
+struct DebugHashList {
+	std::vector<uint64_t> values;
+
+	explicit DebugHashList(const char* name) {
+		const char* text = std::getenv(name);
+		while (text != nullptr && *text != '\0') {
+			char*      end   = nullptr;
+			const auto value = std::strtoull(text, &end, 16);
+			if (end == text) {
+				text++;
+				continue;
+			}
+			values.push_back(static_cast<uint64_t>(value));
+			text = end;
+		}
+	}
+
+	[[nodiscard]] bool Contains(uint64_t hash) const {
+		return std::find(values.begin(), values.end(), hash) != values.end();
+	}
+};
+
+const DebugHashList& TraceShaderHashes() {
+	static const DebugHashList list("KYTY_TRACE_SHADER_HASH");
+	return list;
+}
 
 } // namespace
 
@@ -1049,6 +1078,27 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				              vk::AccessFlagBits2::eShaderRead, range, vk_buffer);
 			}
 			binding.layout = image.backing.state.layout;
+			if (TraceShaderHashes().Contains(program.shader_hash)) {
+				const auto& traced = program.info.images[i];
+				LOGF("TRACE image: stage=%u hash=0x%016" PRIx64
+				     " slot=%u dim=%u compare=%d cube=%d written=%d indirect=%d/%u numeric=%u | "
+				     "image fmt=%d depth=%d ext=%ux%ux%u layers=%u levels=%u samples=%u null=%d | "
+				     "view type=%d aspect=0x%x fmt=%d mips=%u+%u layers=%u+%u | layout=%d\n",
+				     static_cast<uint32_t>(program.stage), program.shader_hash, i,
+				     static_cast<uint32_t>(traced.dimension), static_cast<int>(traced.depth_compare),
+				     static_cast<int>(traced.cube), static_cast<int>(traced.written),
+				     static_cast<int>(traced.indirect_root !=
+				                      ShaderRecompiler::IR::ImageResource::NoIndirectImage),
+				     static_cast<uint32_t>(traced.indirect_resources.size()),
+				     static_cast<uint32_t>(traced.numeric_class),
+				     static_cast<int>(image.info.pixel_format), static_cast<int>(image.info.IsDepth()),
+				     image.info.extent.width, image.info.extent.height, image.info.extent.depth,
+				     image.info.resources.layers, image.info.resources.levels, image.info.samples,
+				     static_cast<int>(image.info.data.Empty()), static_cast<int>(view.type),
+				     static_cast<vk::ImageAspectFlags::MaskType>(view.aspect),
+				     static_cast<int>(view.format), view.base_level, view.level_count, view.base_layer,
+				     view.layer_count, static_cast<int>(binding.layout));
+			}
 		}
 
 		m_image_occurrences.assign(descriptors.images.size(), 0);
